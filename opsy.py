@@ -1,312 +1,141 @@
-from __future__ import division
-import os
-import time
 import math
-from glob import glob
+import numpy as np 
 import tensorflow as tf
-import numpy as np
-from six.moves import xrange
-
-from opsy import *
-
-import numpy as np
-import csv
-import tensorflow as tf
+import tensorflow.contrib.slim as slim
 import tensorflow.contrib.layers as layers
-import random
 
-class entity():
-    def __init__(self, ent):
-        self.id = int(ent[0])
-        self.features = ent[1:-1].astype(int)
-        self.label = int(ent[-1].split('_')[1])-1
+
+image_summary = tf.summary.image
+scalar_summary = tf.summary.scalar
+histogram_summary = tf.summary.histogram
+merge_summary = tf.summary.merge
+SummaryWriter = tf.summary.FileWriter
+
+def concat(tensors, axis, *args, **kwargs):
+    return tf.concat(tensors, axis, *args, **kwargs)
+
+#shape of vector: [None, ...(# of capsules)..., Caps-D]
+def squash(vector,  axis=-1, epsilon=1e-5, name='squash_op'):
+    with tf.name_scope(name) as scope:
+        vec_norm_sq = tf.reduce_sum(tf.square(vector), axis=axis, keep_dims=True)
+        vec_norm = tf.sqrt(vec_norm_sq+epsilon) #prevents from zero division
+        scale = (vec_norm_sq)/(1+vec_norm_sq)
+        squashed_vector = scale * (vector/vec_norm)
         
-class testEntity():
-    def __init__(self, ent):
-        self.id = int(ent[0])
-        self.features = ent[1:].astype(int)
-        
-class secondEntity():
-    def __init__(self, ent):
-        self.id = int(ent[0])
-        self.features = ent[1:].astype(float)
-        
+        return squashed_vector
 
-class Capsule(object):
-    def __init__(self, sess, input_size=93, input_width=None, crop=True,
-        batch_size=64,  c_dim=1, primary_dim=10, digit_dim=16, reg_para = 0.0005, n_conv=256,
-        n_primary=32, n_digit=9, recon_h1=64, recon_h2=128, checkpoint_dir=None):
+def margin_loss(logit, pred_label, m_plus=0.9, m_minus=0.1, lamb=0.5):
+    pred_label = tf.one_hot(pred_label, depth=9)
+    print(logit)
+    print(pred_label)
+    print(tf.square(tf.maximum(0., m_plus-logit)))
 
-        self.sess = sess
-        self.crop = crop
-
-        self.batch_size = batch_size
-
-        self.input_size = input_size
-
-        self.c_dim = c_dim
-
-        self.primary_dim = primary_dim
-        self.digit_dim = digit_dim
-
-        self.n_conv = n_conv
-        self.n_primary=n_primary
-        self.n_digit = n_digit
-
-        self.recon_h1 = recon_h1
-        self.recon_h2 = recon_h2
+    loss = pred_label * tf.square(tf.maximum(0., m_plus-logit))
+    loss += lamb* (1-pred_label) * tf.square(tf.maximum(0., logit-m_minus))
     
-        self.recon_output = self.input_size
+    return tf.reduce_mean(tf.reduce_sum(loss, axis=1))
 
-        self.reg_para = reg_para
+def reconstruction_loss(input_, recon):
+    input_dim = input_.get_shape().as_list()[1:]
+    len_dim = len(input_dim)
+    input_size = 1
+    for i in range(len_dim): input_size *=input_dim[i]
+
+    input_ = tf.reshape(input_, [-1, input_size])
+    recon = tf.reshape(recon, [-1, input_size])
+
+    return tf.reduce_mean(tf.reduce_sum(tf.square(input_ - recon), axis=-1))
+    
+def conv1d(input_, output_dim, is_training=True, reuse=False, name='conv1d_layer'):
+    input_tiled = tf.expand_dims(input_, axis=-1, name='input_expand_1')
+    
+    with tf.variable_scope(name):
+        with tf.variable_scope('first_layer'):
+            net = tf.layers.conv1d(inputs=input_tiled, filters=256, kernel_size=93, activation=None)
+            net = layers.batch_norm(net, decay=0.9, updates_collections=None, is_training=is_training)
+            net = tf.nn.relu(net)
+        with tf.variable_scope('second_layer'):
+            net = tf.layers.conv1d(inputs=net, filters=output_dim * 10, kernel_size=1, activation=None)
+        print(net)
         
-        self.load_input()
-        self.build_model()
+        return net
 
-    def build_model(self):
-        self.primary_caps_layer = CapsConv(self.primary_dim, name='primary_caps')
-        self.digit_caps_layer= CapsConv(self.digit_dim, name='digit_caps')
+def fc_layer(input_, output_dim, initializer = tf.truncated_normal_initializer(stddev=0.02), activation='linear', name=None):
+    shape = input_.get_shape().as_list()
 
-        self.input_x = tf.placeholder(dtype=tf.float32, shape=(None, 93), name='inputs')
-        self.input_y = tf.placeholder(dtype=tf.int32, shape=(self.batch_size), name='labels')
-        self.is_training = tf.placeholder(tf.bool)
-        self.recon_with_label = tf.placeholder_with_default(True, shape=(), name='reconstruction_with_label')
+    with tf.variable_scope(name or "Linear") as scope:
+        if len(shape) > 2 : input_ = tf.layers.flatten(input_)
+        w = tf.get_variable("fc_w", [shape[1], output_dim], dtype=tf.float32, initializer = initializer)
+        b = tf.get_variable("fc_b", [output_dim], initializer = tf.constant_initializer(0.0))
 
-        self.first_fc = conv1d(self.input_x, 32, self.is_training)
-        self.primary_caps = self.primary_caps_layer(self.first_fc, self.n_digit, is_training=self.is_training)
-        self.digit_caps = self.digit_caps_layer(self.primary_caps, self.n_digit, is_training=self.is_training) ## shape: [batch_size, num_caps, dim_caps]
-        
-        with tf.variable_scope("prediction") as scope:
-            self.logit = tf.sqrt(tf.reduce_sum(tf.square(self.digit_caps), axis=-1)) #[batch_size, num_caps]
-            self.prob = tf.nn.softmax(self.logit)
-            self.pred_label = tf.argmax(self.prob, axis=1)
+        result = tf.matmul(input_, w) + b
 
-        with tf.variable_scope("reconstruction") as scope:
-            self.recon = self.reconstruction(name='reconstruction')
+        if activation == 'linear':
+            return result
+        elif activation == 'relu':
+            return tf.nn.relu(result)
+        elif activation == 'sigmoid':
+            return tf.nn.sigmoid(result)
 
-        with tf.variable_scope("loss") as scope:
-            self.m_loss = margin_loss(self.logit, self.input_y)
-            self.r_loss = reconstruction_loss(self.input_x, self.recon)
-            self.loss = tf.add(self.m_loss, self.reg_para * self.r_loss)
+class CapsConv(object):
+    def __init__(self, d_caps, name=None,  is_train=True):
+        self.d_caps = d_caps
+        self.name = name if not name == None else "primary_caps"
+        self.reuse = is_train
 
-            self.m_loss_sum = tf.summary.scalar("margin_loss", self.m_loss)
-            self.r_loss_sum = tf.summary.scalar("reconstruction_loss", self.r_loss)
-            self.loss_sum = tf.summary.scalar("total_loss", self.loss)
-            
-            self.acc = self.accuracy(self.input_y, self.prob)
-            self.acc_sum = tf.summary.scalar("accuracy", self.acc)
+    def __call__(self, input_, n_caps, is_training, kernel_size=9, stride_size=2, route_iter=3, initializer = tf.truncated_normal_initializer(stddev=0.02)):
+        input_shape = input_.get_shape().as_list()
+        batch_size = tf.shape(input_)[0]
+        #[None, height, width, channel]
+    
+        if 'primary' in self.name: #Primary Capsule
+            with tf.variable_scope(self.name) as scope:
+                    
+                print((input_shape[1]*input_shape[2])/self.d_caps)
+                total_num_cap = int((input_shape[1]*input_shape[2])/self.d_caps)
 
-        self.counter = tf.Variable(0, name='global_step', trainable=False)
-
-    def reconstruction(self, name='reconstruction'):
-        if self.sess.run(self.recon_with_label) == True:
-            recon_mask = tf.one_hot(self.input_y, depth=self.n_digit, name='mask_output') #shape = [batch_size, 9]
-        else:
-            mask_target = self.pred_label  #shape = [batch_size]
-            recon_mask = tf.one_hot(mask_target, depth=self.n_digit, name='mask_output') #shape = [batch_size, 9]
-
-        recon_mask = tf.reshape(recon_mask, [-1, self.n_digit, 1], name='reshape_mask_output') # shape [batch_size, 9 ,1]
-
-        recon_mask = tf.multiply(self.digit_caps, recon_mask, name='mask_result')
-        recon_mask = tf.layers.flatten(recon_mask, name='mask_input')
-
-        with tf.variable_scope(name) as scope:
-            hidden1 = fc_layer(recon_mask, self.recon_h1, activation='relu',name='hidden1')
-            hidden2 = fc_layer(hidden1, self.recon_h2, activation='relu',name='hidden2')
-            output = fc_layer(hidden2, self.recon_output, activation='sigmoid',name='reconstruction')
-
-        return output
-
-    def train(self, restore=0):
-        opt = layers.optimize_loss(loss=self.loss,
-                                global_step=self.counter,
-                                learning_rate=1e-3,
-                                summaries = None,
-                                optimizer = tf.train.AdamOptimizer,
-                                clip_gradients = 0.1)
-
-        if restore == 0:
-            tf.global_variables_initializer().run()
-        else:
-            self.restore()
-
-        self.summary_op = tf.summary.merge_all()
-
-        batch_num = int(len(self.train_data)/self.batch_size)
-
-        self.writer = tf.summary.FileWriter('./logs', self.sess.graph)
-
-        for epoch in range(3):
-            seed = 100
-            np.random.seed(seed)
-            np.random.shuffle(self.train_data)
-
-            for idx in range(batch_num-1):
-                start_time = time.time()
+                capsules = tf.reshape(input_, [batch_size, total_num_cap, self.d_caps])
+                print('--capsules--')
+                print(capsules)
+                capsules = squash(capsules)
+                print(capsules)
                 
-                batch = self.train_data[idx*self.batch_size: (idx+1)*self.batch_size]
-                batch_x = [data.features for data in batch]
-                batch_y = [data.label for data in batch]
+                return capsules
 
-                feed_dict = {self.input_x: batch_x, self.input_y: batch_y, self.is_training: True}
+        else: #Digit Capsule
+            with tf.variable_scope(self.name) as scope:
+                #let assume input_: [batch_size, # of capsules, d-capsules]
+                #if len(input_shape) ==2 : input_ = tf.expand_dims(input_, axis=-1)
+                self.input_shape = input_.get_shape().as_list()
+                input_tiled = tf.expand_dims(input_, axis=-1, name='input_expand_1')
+                input_tiled = tf.expand_dims(input_tiled, axis=2, name='input_expand_2') # [batch_size, # of capsule, ..., d-capsules, 1]
+                print('--input_tiled--')
+                print(input_tiled)
+                
+                input_tiled = tf.tile(input_tiled, [1,1, n_caps, 1,1], name='input_tile') # [batch_size, # of capsule, # of next capsule, d_capsules, 1]
+                print('--input_tiled--')
+                print(input_tiled)
 
-                _, loss, train_accuracy, summary_str =  self.sess.run([opt, self.loss, self.acc, self.summary_op], feed_dict=feed_dict) #add summary opt.
-                total_count = tf.train.global_step(self.sess, self.counter)
-                self.writer.add_summary(summary_str, total_count)
+                W = tf.get_variable('prediction_w', [1,self.input_shape[1], n_caps, self.d_caps, self.input_shape[2]], initializer = initializer)
+                W_tiled = tf.tile(W, [batch_size, 1,1,1,1], name = 'W_tiled')
 
-                if total_count % 100 == 0:
-                    print("Epoch: [%2d] [%4d/%4d] time: %4.4f, train_loss: %.8f, train_accurracy: %.8f" \
-                    % (epoch, idx, batch_num-1, time.time() - start_time, loss, train_accuracy))
+                prediction_vectors = tf.matmul(W_tiled, input_tiled)
 
-    def validation_check(self):
-        val_num = int(len(self.test_data)/self.batch_size)
-        val_loss, val_accuracy = 0.0, 0.0
-        for idx in range(val_num-1):
-            valid = self.test_data[idx*self.batch_size: (idx+1)*self.batch_size]
-            valid_x = [data.features for data in valid]
-            valid_y = [data.label for data in valid]
-            
-            feed_dict = {self.input_x: valid_x, self.input_y: valid_y, self.is_training: False}
-            loss, accuracy = self.sess.run([self.loss, self.acc], feed_dict=feed_dict)
-            val_loss += loss
-            val_accuracy += accuracy
-    
-        val_loss /=(val_num-1)
-        val_accuracy /= (val_num-1)
-        print("[*] Validation: loss = %.8f, accuracy: %.8f"\
-          %(val_loss, val_accuracy))
+                b = tf.zeros([batch_size, self.input_shape[1], n_caps,1,1])
 
-    def test_check(self):
-        self.test_load_input()
-        temp = 0
-        predict = []
-        f = open("C:\\Users\\Moon\\Desktop\\Moon's\\kaggle\\submitFile1.csv",'w', newline='')
-        writer = csv.writer(f)
-        writer.writerow(['id','Class_1','Class_2','Class_3', 'Class_4', 'Class_5', 'Class_6', 'Class_7', 'Class_8', 'Class_9'])
-    
-        for batch_index in range(len(self.testData) // self.batch_size):
-            batch = self.testData[batch_index * self.batch_size : (batch_index + 1) * self.batch_size]
-            batch_id = [data.id for data in batch]
-            batch_data = [data.features for data in batch]
-            
-            feed_dict = {self.input_x: batch_data, self.is_training: False}
-            test_out = self.sess.run(self.prob, feed_dict=feed_dict)
-            test_out_list = test_out.tolist()
-            for answer_id, answer in zip(batch_id, test_out_list):
-                answer.insert(0, answer_id)
-                predict.append(answer)
-            
-            temp = batch_index
-    
-        batch = self.testData[(temp + 1) * self.batch_size :]
-        batch_id = [data.id for data in batch]
-        batch_data = [data.features for data in batch]
-        
-        feed_dict = {self.input_x: batch_data, self.is_training: False}
-        test_out = self.sess.run(self.prob, feed_dict=feed_dict)
-        test_out_list = test_out.tolist()
-        for answer_id, answer in zip(batch_id, test_out_list):
-            answer.insert(0, answer_id)
-            predict.append(answer)
+                for i in range(route_iter):
+                    coupling_coeff = tf.nn.softmax(b,dim=2)
 
-        for submit in predict:
-            writer.writerow(submit)
-        f.close()
-        
-        print('done!!')
+                    s = tf.multiply(prediction_vectors, coupling_coeff,name='weighted_prediction')
+                    sum_s = tf.reduce_sum(s, axis=1, keep_dims=True, name='weighted_sum')
+                    capsules = squash(sum_s, axis=-2) # (None, 1, # of nex capsule capsule, d_capsule, 1)
+                    caps_out_tile = tf.tile(capsules, [1, self.input_shape[1], 1,1,1], name='capsule_output_tiled')
 
-    def test_reconstruction(self):
-        num_recon = self.batch_size
-        num_test = len(self.test_data)
-        sample_idx = list(np.random.choice(num_test, num_recon))
-        rec = []
-        rec2 = []
-        
-        test_x = [data.features for data in self.test_data]
-        test_y = [data.label for data in self.test_data]
-        test_id = [data.id for data in self.test_data]
-        self.sample_x, self.sample_y, self.sample_id = test_x[0:100], test_y[0:100], test_id[0:100]
-        
-        f = open("C:\\Users\\Moon\\Desktop\\Moon's\\kaggle\\reconstruction_without_labels.csv",'w', newline='')
-        writer = csv.writer(f)
+                    a = tf.matmul(prediction_vectors, caps_out_tile, transpose_a=True, name='agreement')
+                    b = tf.add(b, a, name='update_logit')
 
-        feed_dict = {self.input_x: self.sample_x, self.input_y: self.sample_y, self.is_training: False, self.recon_with_label: False}
-        recon_images = self.sess.run(self.recon, feed_dict=feed_dict)
-        
-        recon_images_list = recon_images.tolist()
-        for recon, rec_id in zip(recon_images_list, self.sample_id):
-            recon.insert(0, rec_id)
-            rec.append(recon)
-        
-        for submit in rec:
-            writer.writerow(submit)
-        
-        f.close()
-        
-        print("[*] Reconstruction data of samples are saved without labels")
-        
-        f = open("C:\\Users\\Moon\\Desktop\\Moon's\\kaggle\\reconstruction_with_labels.csv",'w', newline='')
-        writer = csv.writer(f)
-
-        feed_dict = {self.input_x: self.sample_x, self.input_y: self.sample_y, self.is_training: False, self.recon_with_label: True}
-        recon_images = self.sess.run(self.recon, feed_dict=feed_dict)
-        
-        recon_images_list = recon_images.tolist()
-        for recon, rec_id in zip(recon_images_list, self.sample_id):
-            recon.insert(0, rec_id)
-            rec2.append(recon)
-        
-        for submit in rec2:
-            writer.writerow(submit)
-        
-        f.close()
-        
-        print("[*] Reconstruction data of samples are saved with labels")
-
-    def accuracy(self, y, y_pred):
-        #y: true one-hot label
-        #y_pred: predicted logit
-        y = tf.one_hot(y, depth=9)
-        correct = tf.equal(tf.argmax(y, axis=1), tf.argmax(y_pred, axis=1))
-        accuracy = tf.reduce_mean(tf.cast(correct, tf.float32), name='accuracy')
-        return accuracy
-    
-    def load_input(self):
-        with open("C:\\Users\\Moon\\Desktop\\Moon's\\kaggle\\train.csv", 'r') as f:
-            reader = csv.reader(f)
-            table_all = np.array(list(reader))
-            
-        data = [entity(ent) for ent in table_all[1:]]
-        random.shuffle(data)
-        
-        self.train_data = data[0:int(len(data) * 0.8)]
-        self.test_data = data[int(len(data) * 0.8):]
-        
-        print('data_setting_done')
-        
-    def test_load_input(self):
-        with open("C:\\Users\\Moon\\Desktop\\Moon's\\kaggle\\test.csv", 'r') as f:
-            reader = csv.reader(f)
-            table_all = np.array(list(reader))
-        
-        self.testData = [testEntity(ent) for ent in table_all[1:]]
-        
-        print('test_data_setting_done')
-        
-    def save(self, checkpoint_path, name):
-        if not os.path.exists(checkpoint_path):
-            os.mkdir(checkpoint_path)
-        checkpoint_name_path =os.path.join(checkpoint_path,'%s.ckpt'% name)
-
-        value_list = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES)
-    
-        saver=tf.train.Saver(value_list)
-        saver.save(self.sess, checkpoint_name_path)
-        
-        print('save done!!')
-        
-    def restore(self):
-        saver = tf.train.Saver()
-        saver.restore(self.sess, "log\\Capsule.ckpt")
-    
-        print('restore done!!')
+                capsules = tf.reshape(capsules, [batch_size, n_caps, self.d_caps])
+                print('--capsules--')
+                print(capsules)
+                
+                return capsules
